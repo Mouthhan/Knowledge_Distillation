@@ -8,10 +8,10 @@ import torchvision.transforms as transforms
 from torchvision.models import resnet50
 import torchvision.models as models
 from tqdm.auto import tqdm
-from model import DistillModel
+from model import DistillModel, DistillModel_DepthSep
 import random
 import numpy as np
-from utils import dkd_loss
+from utils import dkd_loss, hcl_loss, SAM, CenterLoss
 
 
 ## Fix Random Seed
@@ -87,47 +87,63 @@ def train_resnet50_on_fashion_mnist(weights_path):
     teacher.load_state_dict(checkpoint['model_state_dict'])
     teacher.eval()
 
-    student = DistillModel().to(device)
+    student = DistillModel_DepthSep().to(device)
     student.train()
-    student_path = 'models/KD_best_add_DKD_ce_labels_T1_epoch100.pth'
-    EPOCHS = 100
+    student_path = 'models/KD_depthsep_ASAM_epoch200_DKD.pth'
+    EPOCHS = 200
     lr = 3e-4
-    optimizer = torch.optim.AdamW(student.parameters(), lr = lr)
+    # optimizer = torch.optim.AdamW(student.parameters(), lr = lr)
+    base_optimizer = torch.optim.AdamW  # define an optimizer for the "sharpness-aware" update
+    optimizer = SAM(student.parameters(), base_optimizer, lr=lr,adaptive=True, rho=2.0)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
-    dkd_alpha = 1
-    dkd_beta = 8
+    criterion_hard = nn.CrossEntropyLoss(label_smoothing=0.2)
+    # center_loss = CenterLoss(num_classes=10, feat_dim=256, use_gpu=True)
+    dkd_alpha = 0.5
+    dkd_beta = 0.5
     dkd_T = 1
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=3e-4, steps_per_epoch=len(train_loader), epochs=EPOCHS)
-    # alpha = 0.5
-    # beta = 1.0
+    # scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer.base_optimizer, max_lr=3e-4, steps_per_epoch=len(train_loader), epochs=EPOCHS)
     best_acc = 0.0
     for epoch in range(EPOCHS):
         train_loss = []
         train_CE_loss = []
         train_KL_loss = []
+        train_center_loss = []
         correct = 0
         total = 0
         student.train()
-        # print(f'Alpha = {alpha:.5f}, Beta = {beta:.5f}')
         for data in tqdm(train_loader):
+            # with torch.set_grad_enabled(True):
             with torch.cuda.amp.autocast():
                 images, labels = data
                 images, labels = images.to(device), labels.to(device)
-                teacher_outputs = teacher(images)
-                outputs = student(images)
                 
-                loss_CE = criterion(outputs, labels)
-                loss_KL = dkd_loss(outputs, teacher_outputs, labels, dkd_alpha, dkd_beta, dkd_T)
-                loss = loss_CE + loss_KL
-                loss.backward()
+                for i in range(2):
+                    teacher_outputs = teacher(images)
+                    outputs, feature = student(images)
+                    
+                    loss_CE = criterion(outputs, teacher_outputs.softmax(dim=-1))
+                    loss_CE_hard = criterion_hard(outputs, labels)
+                    loss_KL = dkd_loss(outputs, teacher_outputs, labels, dkd_alpha, dkd_beta, dkd_T)
+                    # loss_center = center_loss(feature, labels)
+                    if epoch < 50:
+                        loss = loss_CE + loss_CE_hard + loss_KL
+                    elif epoch < 100:
+                        loss = loss_CE + loss_CE_hard
+                    else:
+                        loss = loss_CE_hard
+                    loss.backward()
+                    if i == 0:
+                        optimizer.first_step(zero_grad=True)
+                        
+                        train_loss.append(loss.item())
+                        train_CE_loss.append(loss_CE.item())
+                        train_KL_loss.append(loss_KL.item())
+                        # train_center_loss.append(loss_center.item())
+                    else:
+                        optimizer.second_step(zero_grad=True)
                 
-                train_loss.append(loss.item())
-                train_CE_loss.append(loss_CE.item())
-                train_KL_loss.append(loss_KL.item())
-                
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
+                # scheduler.step()
+                # optimizer.zero_grad()
                 
                 _, predicted = torch.max(outputs.data, 1)
                 total += labels.size(0)
@@ -135,12 +151,14 @@ def train_resnet50_on_fashion_mnist(weights_path):
         train_loss = sum(train_loss) / len(train_loss)
         train_CE_loss = sum(train_CE_loss) / len(train_CE_loss)
         train_KL_loss = sum(train_KL_loss) / len(train_KL_loss)
+        # train_center_loss = sum(train_center_loss) / len(train_center_loss)
         accuracy = correct / total
         print(f"[ Train {epoch + 1:03d}/{EPOCHS:03d} ] Accuracy = {accuracy:.5f}, Loss = {train_loss:.5f}, CE Loss = {train_CE_loss:.5f}, KL Loss = {train_KL_loss:.5f}")
         
         valid_loss = []
         valid_CE_loss = []
         valid_KL_loss = []
+        # valid_center_loss = []
         correct = 0
         total = 0
         student.eval()
@@ -149,21 +167,30 @@ def train_resnet50_on_fashion_mnist(weights_path):
                 images, labels = data
                 images, labels = images.to(device), labels.to(device)
                 teacher_outputs = teacher(images)
-                outputs = student(images)
+                outputs, feature = student(images)
                 
-                loss_CE = criterion(outputs, labels)
+                loss_CE = criterion(outputs, teacher_outputs.softmax(dim=-1))
+                loss_CE_hard = criterion_hard(outputs, labels)
                 loss_KL = dkd_loss(outputs, teacher_outputs, labels, dkd_alpha, dkd_beta, dkd_T)
-                loss = loss_CE + loss_KL
+                # loss_center = center_loss(feature, labels)
+                if epoch < 50:
+                    loss = loss_CE + loss_CE_hard + loss_KL
+                elif epoch < 100:
+                    loss = loss_CE + loss_CE_hard
+                else:
+                    loss = loss_CE_hard
                 
                 valid_loss.append(loss.item())
                 valid_CE_loss.append(loss_CE.item())
                 valid_KL_loss.append(loss_KL.item())
+                # valid_center_loss.append(loss_center.item())
                 _, predicted = torch.max(outputs.data, 1)
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
         valid_loss = sum(valid_loss) / len(valid_loss)
         valid_CE_loss = sum(valid_CE_loss) / len(valid_CE_loss)
         valid_KL_loss = sum(valid_KL_loss) / len(valid_KL_loss)
+        # valid_center_loss = sum(valid_center_loss) / len(valid_center_loss)
         accuracy = correct / total
         print(f"[ Valid {epoch + 1:03d}/{EPOCHS:03d} ] Accuracy = {accuracy:.5f}, Loss = {valid_loss:.5f}, CE Loss = {valid_CE_loss:.5f}, KL Loss = {valid_KL_loss:.5f}")
         if accuracy > best_acc:
@@ -174,6 +201,7 @@ def train_resnet50_on_fashion_mnist(weights_path):
         test_loss = []
         test_CE_loss = []
         test_KL_loss = []
+        # test_center_loss = []
         correct = 0
         total = 0
         student.eval()
@@ -182,24 +210,32 @@ def train_resnet50_on_fashion_mnist(weights_path):
                 images, labels = data
                 images, labels = images.to(device), labels.to(device)
                 teacher_outputs = teacher(images)
-                outputs = student(images)
+                outputs, feature = student(images)
                 
-                loss_CE = criterion(outputs, labels)
+                loss_CE = criterion(outputs, teacher_outputs.softmax(dim=-1))
+                loss_CE_hard = criterion_hard(outputs, labels)
                 loss_KL = dkd_loss(outputs, teacher_outputs, labels, dkd_alpha, dkd_beta, dkd_T)
-                loss = loss_CE + loss_KL
+                # loss_center = center_loss(feature, labels)
+                if epoch < 50:
+                    loss = loss_CE + loss_CE_hard + loss_KL
+                elif epoch < 100:
+                    loss = loss_CE + loss_CE_hard
+                else:
+                    loss = loss_CE_hard
                 
                 test_loss.append(loss.item())
                 test_CE_loss.append(loss_CE.item())
                 test_KL_loss.append(loss_KL.item())
+                # test_center_loss.append(loss_center.item())
                 _, predicted = torch.max(outputs.data, 1)
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
         test_loss = sum(test_loss) / len(test_loss)
         test_CE_loss = sum(test_CE_loss) / len(test_CE_loss)
         test_KL_loss = sum(test_KL_loss) / len(test_KL_loss)
+        # test_center_loss = sum(test_center_loss) / len(test_center_loss)
         accuracy = correct / total
         print(f"[ Test  {epoch + 1:03d}/{EPOCHS:03d} ] Accuracy = {accuracy:.5f}, Loss = {test_loss:.5f}, CE Loss = {test_CE_loss:.5f}, KL Loss = {test_KL_loss:.5f}")
-
     return accuracy
 
 
